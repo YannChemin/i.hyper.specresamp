@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>i.hyper.specresamp - GRASS GIS manual</title>
+<meta charset="utf-8">
+</head>
+<body>
+
+<h2>DESCRIPTION</h2>
+
+<p><em>i.hyper.specresamp</em> performs spectral resampling of hyperspectral 
+imagery stored as 3D raster maps (<code>raster_3d</code>) from the 
+<em>i.hyper</em> module family. The module resamples hyperspectral data to a 
+new wavelength sampling interval, useful for harmonizing datasets from different 
+sensors or reducing spectral dimensionality.</p>
+
+<p>The module reads wavelength metadata from the input 3D raster bands and 
+generates a new 3D raster with bands at the specified target wavelength 
+intervals. Three resampling methods are available to accommodate different 
+use cases and accuracy requirements.</p>
+
+<p>Spectral resampling is commonly needed when:</p>
+<ul>
+  <li>Combining data from sensors with different spectral samplings</li>
+  <li>Reducing spectral dimensionality for computational efficiency</li>
+  <li>Matching hyperspectral data to multispectral sensor specifications</li>
+  <li>Preparing data for algorithms that require specific wavelength bands</li>
+  <li>Simulating sensor characteristics for validation studies</li>
+</ul>
+
+<h2>RESAMPLING METHODS</h2>
+
+<h3>Gaussian Convolution (default)</h3>
+<p>The <b>gaussian</b> method uses Gaussian-weighted spectral response functions 
+centered at each target wavelength. This is the most physically realistic method 
+as it mimics how real sensors integrate energy across their spectral bands. The 
+Full Width at Half Maximum (FWHM) parameter controls the bandwidth of the 
+Gaussian response. By default, FWHM equals the target wavelength step, but it 
+can be adjusted to simulate specific sensor characteristics.</p>
+
+<p>This method is recommended for most applications, especially when simulating 
+multispectral sensors or when physical accuracy is important.</p>
+
+<h3>Nearest Neighbor</h3>
+<p>The <b>nearest</b> method selects the input band closest to each target 
+wavelength. This is the fastest method but produces discontinuous results. Use 
+this for quick testing or when you simply want to extract specific wavelength 
+bands without interpolation.</p>
+
+<h3>Linear Interpolation</h3>
+<p>The <b>linear</b> method linearly interpolates between the two nearest input 
+bands. This provides smooth results and is faster than Gaussian convolution, but 
+doesn't account for realistic sensor response characteristics. Useful when 
+computational speed is important and physical accuracy is less critical.</p>
+
+<h2>NOTES</h2>
+
+<p>The module requires wavelength metadata in the input 3D raster. This metadata 
+is automatically added by <em>i.hyper.import</em>. The required metadata fields 
+are: <b>wavelength</b>, <b>unit</b>, and optionally <b>FWHM</b> and <b>valid</b>.</p>
+
+<p>Output wavelengths are automatically constrained to the range of input 
+wavelengths. If you specify target_start or target_end outside the input range, 
+they will be adjusted to the input range boundaries.</p>
+
+<p>The <b>-n</b> flag restricts processing to only bands marked as valid 
+(<code>valid=1</code>) in the metadata. This is useful for excluding problematic 
+bands affected by atmospheric absorption or sensor artifacts.</p>
+
+<p>The <b>-i</b> flag provides information mode that displays the resampling 
+plan without creating output. Use this to verify wavelength mappings and the 
+number of output bands before processing.</p>
+
+<h3>FWHM Parameter</h3>
+<p>The FWHM (Full Width at Half Maximum) parameter controls the bandwidth of the 
+Gaussian response function. Smaller FWHM values produce narrower spectral 
+responses (more selective), while larger values produce broader responses (more 
+smoothing). The default FWHM equals the target wavelength step, which is 
+appropriate for most applications.</p>
+
+<p>For simulating specific sensors, set FWHM to match the sensor's spectral 
+bandwidth. For example, Landsat 8 OLI bands have FWHM values ranging from 
+60-180 nm.</p>
+
+<h3>Memory Considerations</h3>
+<p>The module processes one output band at a time using <em>r.mapcalc</em>, which 
+is memory-efficient for large datasets. Temporary 2D rasters are created for each 
+output band and then stacked into the final 3D raster using <em>r.to.rast3</em>.</p>
+
+<h2>EXAMPLES</h2>
+
+<div class="code"><pre>
+# Resample PRISMA data (400-2400nm @ ~3nm) to 10nm spacing
+i.hyper.specresamp input=prisma \
+                   output=prisma_10nm \
+                   target_step=10
+
+# This will create output from 400-2400nm at 10nm intervals
+# Using Gaussian convolution with FWHM=10nm
+</pre></div>
+
+<div class="code"><pre>
+# Resample to coarser 30nm spacing for faster processing
+i.hyper.specresamp input=enmap \
+                   output=enmap_30nm \
+                   target_step=30 \
+                   method=gaussian \
+                   fwhm=30
+</pre></div>
+
+<div class="code"><pre>
+# Extract only VNIR range (400-1000nm) at 5nm spacing
+i.hyper.specresamp input=prisma \
+                   output=prisma_vnir_5nm \
+                   target_start=400 \
+                   target_end=1000 \
+                   target_step=5 \
+                   method=gaussian
+</pre></div>
+
+<div class="code"><pre>
+# Quick band selection using nearest neighbor (fast)
+i.hyper.specresamp input=tanager \
+                   output=tanager_20nm \
+                   target_step=20 \
+                   method=nearest
+</pre></div>
+
+<div class="code"><pre>
+# Simulate Landsat 8 OLI band 5 (NIR: 851-879nm, center=865nm)
+# Using narrow range and appropriate FWHM
+i.hyper.specresamp input=prisma \
+                   output=prisma_oli_b5 \
+                   target_start=865 \
+                   target_end=865 \
+                   target_step=1 \
+                   method=gaussian \
+                   fwhm=28
+</pre></div>
+
+<div class="code"><pre>
+# Preview resampling plan before processing
+i.hyper.specresamp input=enmap \
+                   output=test \
+                   target_step=15 \
+                   -i
+
+# Output shows:
+# - Input wavelength range and number of bands
+# - Output wavelength range and number of bands
+# - Resampling method parameters
+# - List of output wavelengths
+</pre></div>
+
+<div class="code"><pre>
+# Use only valid bands and linear interpolation
+i.hyper.specresamp input=prisma \
+                   output=prisma_12nm_valid \
+                   target_step=12 \
+                   method=linear \
+                   -n
+</pre></div>
+
+<div class="code"><pre>
+# Complete workflow: import, resample, calculate albedo
+# Step 1: Import hyperspectral data
+i.hyper.import input=/data/PRISMA.he5 \
+               product=prisma \
+               output=prisma_full
+
+# Step 2: Resample to 10nm for faster processing
+i.hyper.specresamp input=prisma_full \
+                   output=prisma_10nm \
+                   target_step=10
+
+# Step 3: Calculate albedo from resampled data
+i.hyper.albedo input=prisma_10nm \
+               output=prisma_albedo \
+               weighting=solar
+
+# Step 4: Compare processing time vs original
+# (resampled data processes much faster)
+</pre></div>
+
+<div class="code"><pre>
+# Resample SWIR region to match VNIR sampling
+# If VNIR is at 5nm and SWIR at 10nm, standardize to 10nm
+i.hyper.specresamp input=enmap_swir \
+                   output=enmap_swir_10nm \
+                   target_step=10 \
+                   method=gaussian \
+                   fwhm=10
+</pre></div>
+
+<h2>SEE ALSO</h2>
+
+<a href="i.hyper.import.html">i.hyper.import</a>,
+<a href="i.hyper.albedo.html">i.hyper.albedo</a>,
+<a href="i.hyper.rgb.html">i.hyper.rgb</a>,
+<a href="i.hyper.composite.html">i.hyper.composite</a>,
+<a href="i.hyper.preproc.html">i.hyper.preproc</a>,
+<a href="https://grass.osgeo.org/grass-stable/manuals/r.mapcalc.html">r.mapcalc</a>,
+<a href="https://grass.osgeo.org/grass-stable/manuals/r.to.rast3.html">r.to.rast3</a>,
+<a href="https://grass.osgeo.org/grass-stable/manuals/r3.univar.html">r3.univar</a>,
+<a href="https://grass.osgeo.org/grass-stable/manuals/r3.support.html">r3.support</a>
+
+<h2>REFERENCES</h2>
+
+<ul>
+  <li>Guanter, L., et al. (2015). The EnMAP spaceborne imaging spectroscopy 
+    mission for earth observation. <em>Remote Sensing</em>, 7(7), 8830-8857.</li>
+  <li>Loizzo, R., et al. (2018). PRISMA: The Italian hyperspectral mission. 
+    <em>IGARSS 2018-2018 IEEE International Geoscience and Remote Sensing 
+    Symposium</em>, 175-178.</li>
+  <li>Chander, G., Markham, B. L., & Helder, D. L. (2009). Summary of current 
+    radiometric calibration coefficients for Landsat MSS, TM, ETM+, and EO-1 
+    ALI sensors. <em>Remote Sensing of Environment</em>, 113(5), 893-903.</li>
+  <li>Huete, A., et al. (2002). Overview of the radiometric and biophysical 
+    performance of the MODIS vegetation indices. <em>Remote Sensing of 
+    Environment</em>, 83(1-2), 195-213.</li>
+</ul>
+
+<h2>AUTHORS</h2>
+
+<p>Created for the i.hyper module family</p>
+
+<p>Based on spectral resampling concepts from hyperspectral remote sensing community</p>
+
+</body>
+</html>
