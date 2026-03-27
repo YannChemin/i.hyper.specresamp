@@ -82,10 +82,21 @@ appropriate for most applications.</p>
 bandwidth. For example, Landsat 8 OLI bands have FWHM values ranging from 
 60-180 nm.</p>
 
-<h3>Memory Considerations</h3>
-<p>The module processes one output band at a time using <em>r.mapcalc</em>, which 
-is memory-efficient for large datasets. Temporary 2D rasters are created for each 
-output band and then stacked into the final 3D raster using <em>r.to.rast3</em>.</p>
+<h3>Performance</h3>
+<p>Before the resampling loop, all input bands that contribute non-negligible weight
+to any output band are extracted to temporary 2D rasters via
+<code>Rast3d_extract_z_slice()</code> (from <code>lib/raster3d/slice.c</code>).
+That function opens the 3D map with <code>RASTER3D_NO_CACHE</code> and calls
+<code>Rast3d_get_block()</code>, which reads each tile at the target Z level exactly
+once in bulk rather than one function call per voxel. The subsequent
+<em>r.mapcalc</em> expressions reference these pre-extracted 2D rasters, so the
+slow 3D voxel-by-voxel accessor (<code>map3d#{band_num}</code>) is never used.</p>
+
+<p>Temporary storage required is proportional to the number of unique input bands
+that carry weight, not the full depth of the cube. Bands with negligible weight
+(&lt; 1e-6) are skipped entirely. Output bands are processed one at a time and
+assembled into the final 3D raster with <em>r.to.rast3</em>; all temporary maps
+are removed on completion.</p>
 
 <h2>EXAMPLES</h2>
 
@@ -202,7 +213,8 @@ i.hyper.specresamp input=enmap_swir \
 <a href="https://grass.osgeo.org/grass-stable/manuals/r.mapcalc.html">r.mapcalc</a>,
 <a href="https://grass.osgeo.org/grass-stable/manuals/r.to.rast3.html">r.to.rast3</a>,
 <a href="https://grass.osgeo.org/grass-stable/manuals/r3.univar.html">r3.univar</a>,
-<a href="https://grass.osgeo.org/grass-stable/manuals/r3.support.html">r3.support</a>
+<a href="https://grass.osgeo.org/grass-stable/manuals/r3.support.html">r3.support</a>,
+<a href="https://grass.osgeo.org/grass-stable/manuals/r3.to.rast.html">r3.to.rast</a>
 
 <h2>REFERENCES</h2>
 

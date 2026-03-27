@@ -85,9 +85,66 @@
 
 import sys
 import os
+import ctypes
 import numpy as np
 import grass.script as gs
 from grass.script import array as garray
+
+# ---------------------------------------------------------------------------
+# Fast Z-slice extraction via Rast3d_extract_z_slice() (ctypes)
+# ---------------------------------------------------------------------------
+
+_raster3d_lib = None
+
+
+def _load_raster3d_lib():
+    """Load libgrass_raster3d and its deps via ctypes (once per process)."""
+    global _raster3d_lib
+    if _raster3d_lib is not None:
+        return _raster3d_lib
+
+    gisbase = os.environ["GISBASE"]
+    libdir = os.path.join(gisbase, "lib")
+
+    # Load dependency chain with RTLD_GLOBAL so raster3d resolves their symbols.
+    for name in ("libgrass_gis.so", "libgrass_raster.so"):
+        ctypes.CDLL(os.path.join(libdir, name), ctypes.RTLD_GLOBAL)
+
+    lib = ctypes.CDLL(
+        os.path.join(libdir, "libgrass_raster3d.so"), ctypes.RTLD_GLOBAL
+    )
+    lib.Rast3d_extract_z_slice.restype = ctypes.c_int
+    lib.Rast3d_extract_z_slice.argtypes = [
+        ctypes.c_char_p,  # name3d
+        ctypes.c_char_p,  # mapset3d ("" = search)
+        ctypes.c_int,     # z  (0-based)
+        ctypes.c_char_p,  # name2d
+    ]
+
+    # Initialise GRASS C environment for this process.
+    libgis = ctypes.CDLL(os.path.join(libdir, "libgrass_gis.so"))
+    libgis.G_gisinit(b"i.hyper.specresamp")
+
+    _raster3d_lib = lib
+    return lib
+
+
+def extract_z_slice(name3d, band_num_1based, name2d):
+    """Extract one band (1-based) from a 3D raster to a 2D raster.
+
+    Uses Rast3d_extract_z_slice() which opens the map with RASTER3D_NO_CACHE
+    and calls Rast3d_get_block() for tile-bulk reads — each tile is loaded
+    exactly once instead of one function call per voxel.
+    """
+    lib = _load_raster3d_lib()
+    z = band_num_1based - 1  # convert 1-based band to 0-based z index
+    ret = lib.Rast3d_extract_z_slice(
+        name3d.encode(), b"", ctypes.c_int(z), name2d.encode()
+    )
+    if ret != 0:
+        gs.fatal(
+            f"Rast3d_extract_z_slice failed for band {band_num_1based} of {name3d}"
+        )
 
 
 def get_raster3d_info(raster3d):
@@ -326,31 +383,49 @@ def resample_spectral(input_raster, input_bands, target_wavelengths,
     # Create temporary region for 3D raster operations
     gs.use_temp_region()
     gs.run_command('g.region', raster3d=input_raster)
-    
+
+    # ------------------------------------------------------------------
+    # Pre-extract all needed input slices once via Rast3d_extract_z_slice.
+    # This uses RASTER3D_NO_CACHE + Rast3d_get_block() so each tile at a
+    # given Z level is read exactly once (tile-bulk path), instead of one
+    # function call per voxel through r.mapcalc's #{band_num} accessor.
+    # ------------------------------------------------------------------
+    needed_in_indices = {
+        in_idx
+        for response in responses
+        for in_idx, w in enumerate(response)
+        if w > 1e-6
+    }
+    gs.message(f"Pre-extracting {len(needed_in_indices)} input slices...")
+    slice_maps = {}  # in_idx -> temp 2D raster name
+    for in_idx in sorted(needed_in_indices):
+        band = input_bands[in_idx]
+        slice_name = f"tmp_specresamp_in_{os.getpid()}_{in_idx}"
+        extract_z_slice(input_raster, band['band_num'], slice_name)
+        slice_maps[in_idx] = slice_name
+
     # Process each output band
     temp_maps = []
-    
+
     for out_idx, (target_wl, response) in enumerate(zip(target_wavelengths, responses)):
         gs.percent(out_idx, n_output, 1)
-        
+
         temp_map = f"tmp_specresamp_{os.getpid()}_{out_idx}"
         temp_maps.append(temp_map)
-        
-        # Build r.mapcalc expression for weighted sum
+
+        # Build r.mapcalc expression for weighted sum using pre-extracted 2D slices
         terms = []
         for in_idx, weight in enumerate(response):
             if weight > 1e-6:  # Skip negligible weights
-                band = input_bands[in_idx]
-                band_name = f"{input_raster}#{band['band_num']}"
-                terms.append(f"({weight:.10f} * {band_name})")
-        
+                terms.append(f"({weight:.10f} * {slice_maps[in_idx]})")
+
         if not terms:
             gs.fatal(f"No input bands contribute to output wavelength {target_wl:.2f} nm")
-        
+
         expression = f"{temp_map} = " + " + ".join(terms)
-        
+
         gs.run_command('r.mapcalc', expression=expression, quiet=True, overwrite=True)
-        
+
         # Set metadata for this band
         gs.run_command('r.support', map=temp_map,
                       title=f"Band at {target_wl:.2f} nm",
@@ -360,20 +435,23 @@ def resample_spectral(input_raster, input_bands, target_wavelengths,
         gs.write_command('r.support', map=temp_map, stdin=f"valid=1")
         if method == 'gaussian':
             gs.write_command('r.support', map=temp_map, stdin=f"FWHM={fwhm}")
-    
+
     gs.percent(1, 1, 1)
-    
+
     # Stack temporary maps into 3D raster
     gs.message("Creating output 3D raster...")
     map_list = ",".join(temp_maps)
-    
-    gs.run_command('r.to.rast3', 
+
+    gs.run_command('r.to.rast3',
                   input=map_list,
                   output=output_raster,
                   overwrite=True)
-    
-    # Clean up temporary maps
+
+    # Clean up input slice temp maps
     gs.message("Cleaning up temporary maps...")
+    for name in slice_maps.values():
+        gs.run_command('g.remove', type='raster', name=name, flags='f', quiet=True)
+    # Clean up output band temp maps
     for temp_map in temp_maps:
         gs.run_command('g.remove', type='raster', name=temp_map, flags='f', quiet=True)
     

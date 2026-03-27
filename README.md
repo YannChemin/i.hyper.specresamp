@@ -77,11 +77,21 @@ For simulating specific sensors, set FWHM to match the sensor's spectral
 bandwidth. For example, Landsat 8 OLI bands have FWHM values ranging from 
 60-180 nm.
 
-### Memory Considerations
+### Performance
 
-The module processes one output band at a time using *r.mapcalc*, which 
-is memory-efficient for large datasets. Temporary 2D rasters are created for each 
-output band and then stacked into the final 3D raster using *r.to.rast3*.
+Before the resampling loop, all input bands that contribute non-negligible weight
+to any output band are extracted to temporary 2D rasters via
+`Rast3d_extract_z_slice()` (from `lib/raster3d/slice.c`). That function opens the
+3D map with `RASTER3D_NO_CACHE` and calls `Rast3d_get_block()`, which reads each
+tile at the target Z level exactly once in bulk rather than one function call per
+voxel. The subsequent *r.mapcalc* expressions reference these pre-extracted 2D
+rasters, so the slow 3D voxel-by-voxel accessor (`map3d#{band_num}`) is never used.
+
+Temporary storage required is proportional to the number of unique input bands that
+carry weight, not the full depth of the cube. Bands with negligible weight (< 1e-6)
+are skipped entirely. Output bands are processed one at a time and assembled into
+the final 3D raster with *r.to.rast3*; all temporary maps are removed on
+completion.
 
 ## EXAMPLES
 
@@ -198,7 +208,8 @@ i.hyper.specresamp input=enmap_swir \
 [r.mapcalc](https://grass.osgeo.org/grass-stable/manuals/r.mapcalc.html),
 [r.to.rast3](https://grass.osgeo.org/grass-stable/manuals/r.to.rast3.html),
 [r3.univar](https://grass.osgeo.org/grass-stable/manuals/r3.univar.html),
-[r3.support](https://grass.osgeo.org/grass-stable/manuals/r3.support.html)
+[r3.support](https://grass.osgeo.org/grass-stable/manuals/r3.support.html),
+[r3.to.rast](https://grass.osgeo.org/grass-stable/manuals/r3.to.rast.html)
 
 ## REFERENCES
 
