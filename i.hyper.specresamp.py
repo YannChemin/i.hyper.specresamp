@@ -7,6 +7,20 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 ##############################################################################
 
+# ── ras3d standalone detection ────────────────────────────────────────────────
+import os as _os
+_RAS3D = False
+if not _os.environ.get('GISBASE'):
+    try:
+        import importlib.util as _ilu
+        if _ilu.find_spec('ras3d') and _ilu.find_spec('ras3d_grass_shim'):
+            from ras3d_grass_shim import install as _r3_install
+            _r3_install()
+            _RAS3D = True
+    except Exception:
+        pass
+# ─────────────────────────────────────────────────────────────────────────────
+
 # %module
 # % description: Spectrally resample hyperspectral 3D raster to new wavelength sampling using Gaussian convolution
 # % keyword: imagery
@@ -136,6 +150,15 @@ def extract_z_slice(name3d, band_num_1based, name2d):
     and calls Rast3d_get_block() for tile-bulk reads — each tile is loaded
     exactly once instead of one function call per voxel.
     """
+    if _RAS3D:
+        import ras3d as _r3, ras3d_write as _r3w
+        _h = _r3.open_cube(name3d)
+        _arr = _r3.get_band(_h, band_num_1based - 1)
+        from ras3d_grass_shim import get_band_cache
+        get_band_cache()[name2d] = _arr
+        _r3w.write_raster2d(_r3w.outpath(name2d), _arr, _h)
+        _r3.close_cube(_h)
+        return
     lib = _load_raster3d_lib()
     z = band_num_1based - 1  # convert 1-based band to 0-based z index
     ret = lib.Rast3d_extract_z_slice(
@@ -200,6 +223,21 @@ def convert_wavelength_to_nm(wavelength, unit):
 
 def get_all_band_wavelengths(raster3d, only_valid=False):
     """Extract all band wavelengths and metadata from 3D raster"""
+    if _RAS3D:
+        import json as _json
+        for _sfx in ('', '.tif', '.tiff', '.h5', '.hdf5'):
+            _base = raster3d.removesuffix(_sfx) if raster3d.endswith(_sfx) else raster3d
+            _wlp = _base + '.wl.json'
+            if _os.path.exists(_wlp):
+                with open(_wlp) as _f:
+                    _wl = _json.load(_f)
+                _wl_nm = [w * 1000 if w < 10 else w for w in _wl]
+                return [{'band_num': i+1, 'wavelength': wl, 'fwhm': None, 'valid': 1}
+                        for i, wl in enumerate(_wl_nm)]
+        import ras3d as _r3
+        _h = _r3.open_cube(raster3d); _r = _r3.get_region(_h); _r3.close_cube(_h)
+        return [{'band_num': i+1, 'wavelength': float(i+1), 'fwhm': None, 'valid': 1}
+                for i in range(_r['depths'])]
     info = get_raster3d_info(raster3d)
     depths = int(info['depths'])
     
@@ -380,100 +418,142 @@ def resample_spectral(input_raster, input_bands, target_wavelengths,
             response = linear_interpolation_response(target_wl, input_wl)
         responses.append(response)
     
-    # Create temporary region for 3D raster operations
-    gs.use_temp_region()
-    gs.run_command('g.region', raster3d=input_raster)
+    if _RAS3D:
+        import ras3d as _r3
+        import ras3d_write as _r3w
+        from ras3d_grass_shim import get_band_cache
+        # Pre-load all needed input slices into numpy arrays
+        needed_in_indices = {
+            in_idx
+            for response in responses
+            for in_idx, w in enumerate(response)
+            if w > 1e-6
+        }
+        gs.message(f"[ras3d] Pre-loading {len(needed_in_indices)} input slices...")
+        _h = _r3.open_cube(input_raster)
+        slice_arrays = {}
+        for in_idx in sorted(needed_in_indices):
+            slice_arrays[in_idx] = _r3.get_band(_h, input_bands[in_idx]['band_num'] - 1)
+        _r3.close_cube(_h)
+        # Compute weighted sums in numpy and stack into cube
+        gs.message(f"[ras3d] Computing {n_output} output bands...")
+        out_bands = []
+        _h2 = _r3.open_cube(input_raster)
+        for out_idx, (target_wl, response) in enumerate(zip(target_wavelengths, responses)):
+            gs.percent(out_idx, n_output, 1)
+            accum = None
+            for in_idx, weight in enumerate(response):
+                if weight > 1e-6:
+                    contrib = weight * slice_arrays[in_idx]
+                    accum = contrib if accum is None else accum + contrib
+            if accum is None:
+                gs.fatal(f"No input bands contribute to output wavelength {target_wl:.2f} nm")
+            out_bands.append(accum)
+        gs.percent(1, 1, 1)
+        gs.message("[ras3d] Writing output 3D cube...")
+        _r3w.write_raster3d(
+            _r3w.outpath(output_raster),
+            out_bands,
+            _h2,
+            [float(wl) for wl in target_wavelengths],
+        )
+        _r3.close_cube(_h2)
+        gs.message(f"Successfully created resampled 3D raster: {output_raster}")
+    else:
+        # Create temporary region for 3D raster operations
+        gs.use_temp_region()
+        gs.run_command('g.region', raster3d=input_raster)
 
-    # ------------------------------------------------------------------
-    # Pre-extract all needed input slices once via Rast3d_extract_z_slice.
-    # This uses RASTER3D_NO_CACHE + Rast3d_get_block() so each tile at a
-    # given Z level is read exactly once (tile-bulk path), instead of one
-    # function call per voxel through r.mapcalc's #{band_num} accessor.
-    # ------------------------------------------------------------------
-    needed_in_indices = {
-        in_idx
-        for response in responses
-        for in_idx, w in enumerate(response)
-        if w > 1e-6
-    }
-    gs.message(f"Pre-extracting {len(needed_in_indices)} input slices...")
-    slice_maps = {}  # in_idx -> temp 2D raster name
-    for in_idx in sorted(needed_in_indices):
-        band = input_bands[in_idx]
-        slice_name = f"tmp_specresamp_in_{os.getpid()}_{in_idx}"
-        extract_z_slice(input_raster, band['band_num'], slice_name)
-        slice_maps[in_idx] = slice_name
+        # ------------------------------------------------------------------
+        # Pre-extract all needed input slices once via Rast3d_extract_z_slice.
+        # This uses RASTER3D_NO_CACHE + Rast3d_get_block() so each tile at a
+        # given Z level is read exactly once (tile-bulk path), instead of one
+        # function call per voxel through r.mapcalc's #{band_num} accessor.
+        # ------------------------------------------------------------------
+        needed_in_indices = {
+            in_idx
+            for response in responses
+            for in_idx, w in enumerate(response)
+            if w > 1e-6
+        }
+        gs.message(f"Pre-extracting {len(needed_in_indices)} input slices...")
+        slice_maps = {}  # in_idx -> temp 2D raster name
+        for in_idx in sorted(needed_in_indices):
+            band = input_bands[in_idx]
+            slice_name = f"tmp_specresamp_in_{os.getpid()}_{in_idx}"
+            extract_z_slice(input_raster, band['band_num'], slice_name)
+            slice_maps[in_idx] = slice_name
 
-    # Process each output band
-    temp_maps = []
+        # Process each output band
+        temp_maps = []
 
-    for out_idx, (target_wl, response) in enumerate(zip(target_wavelengths, responses)):
-        gs.percent(out_idx, n_output, 1)
+        for out_idx, (target_wl, response) in enumerate(zip(target_wavelengths, responses)):
+            gs.percent(out_idx, n_output, 1)
 
-        temp_map = f"tmp_specresamp_{os.getpid()}_{out_idx}"
-        temp_maps.append(temp_map)
+            temp_map = f"tmp_specresamp_{os.getpid()}_{out_idx}"
+            temp_maps.append(temp_map)
 
-        # Build r.mapcalc expression for weighted sum using pre-extracted 2D slices
-        terms = []
-        for in_idx, weight in enumerate(response):
-            if weight > 1e-6:  # Skip negligible weights
-                terms.append(f"({weight:.10f} * {slice_maps[in_idx]})")
+            # Build r.mapcalc expression for weighted sum using pre-extracted 2D slices
+            terms = []
+            for in_idx, weight in enumerate(response):
+                if weight > 1e-6:  # Skip negligible weights
+                    terms.append(f"({weight:.10f} * {slice_maps[in_idx]})")
 
-        if not terms:
-            gs.fatal(f"No input bands contribute to output wavelength {target_wl:.2f} nm")
+            if not terms:
+                gs.fatal(f"No input bands contribute to output wavelength {target_wl:.2f} nm")
 
-        expression = f"{temp_map} = " + " + ".join(terms)
+            expression = f"{temp_map} = " + " + ".join(terms)
 
-        gs.run_command('r.mapcalc', expression=expression, quiet=True, overwrite=True)
+            gs.run_command('r.mapcalc', expression=expression, quiet=True, overwrite=True)
 
-        # Set metadata for this band
-        gs.run_command('r.support', map=temp_map,
-                      title=f"Band at {target_wl:.2f} nm",
-                      units="reflectance", quiet=True)
-        gs.write_command('r.support', map=temp_map, stdin=f"wavelength={target_wl}")
-        gs.write_command('r.support', map=temp_map, stdin=f"unit=nm")
-        gs.write_command('r.support', map=temp_map, stdin=f"valid=1")
-        if method == 'gaussian':
-            gs.write_command('r.support', map=temp_map, stdin=f"FWHM={fwhm}")
+            # Set metadata for this band
+            gs.run_command('r.support', map=temp_map,
+                          title=f"Band at {target_wl:.2f} nm",
+                          units="reflectance", quiet=True)
+            gs.write_command('r.support', map=temp_map, stdin=f"wavelength={target_wl}")
+            gs.write_command('r.support', map=temp_map, stdin=f"unit=nm")
+            gs.write_command('r.support', map=temp_map, stdin=f"valid=1")
+            if method == 'gaussian':
+                gs.write_command('r.support', map=temp_map, stdin=f"FWHM={fwhm}")
 
-    gs.percent(1, 1, 1)
+        gs.percent(1, 1, 1)
 
-    # Stack temporary maps into 3D raster
-    gs.message("Creating output 3D raster...")
-    map_list = ",".join(temp_maps)
+        # Stack temporary maps into 3D raster
+        gs.message("Creating output 3D raster...")
+        map_list = ",".join(temp_maps)
 
-    gs.run_command('r.to.rast3',
-                  input=map_list,
-                  output=output_raster,
-                  overwrite=True)
+        gs.run_command('r.to.rast3',
+                      input=map_list,
+                      output=output_raster,
+                      overwrite=True)
 
-    # Clean up input slice temp maps
-    gs.message("Cleaning up temporary maps...")
-    for name in slice_maps.values():
-        gs.run_command('g.remove', type='raster', name=name, flags='f', quiet=True)
-    # Clean up output band temp maps
-    for temp_map in temp_maps:
-        gs.run_command('g.remove', type='raster', name=temp_map, flags='f', quiet=True)
-    
-    # Set 3D raster metadata
-    gs.run_command('r3.support', map=output_raster,
-                  title="Spectrally resampled hyperspectral data",
-                  history=f"Resampled from {input_raster} using {method} method")
-    
-    gs.message(f"Successfully created resampled 3D raster: {output_raster}")
-    
-    # Calculate and report statistics
-    try:
-        stats = gs.parse_command('r3.univar', map=output_raster, flags='g')
-        gs.message("-" * 50)
-        gs.message("Output Statistics:")
-        gs.message(f"  Mean:   {float(stats['mean']):.4f}")
-        gs.message(f"  Min:    {float(stats['min']):.4f}")
-        gs.message(f"  Max:    {float(stats['max']):.4f}")
-        gs.message(f"  StdDev: {float(stats['stddev']):.4f}")
-        gs.message("-" * 50)
-    except:
-        pass
+        # Clean up input slice temp maps
+        gs.message("Cleaning up temporary maps...")
+        for name in slice_maps.values():
+            gs.run_command('g.remove', type='raster', name=name, flags='f', quiet=True)
+        # Clean up output band temp maps
+        for temp_map in temp_maps:
+            gs.run_command('g.remove', type='raster', name=temp_map, flags='f', quiet=True)
+
+        # Set 3D raster metadata
+        gs.run_command('r3.support', map=output_raster,
+                      title="Spectrally resampled hyperspectral data",
+                      history=f"Resampled from {input_raster} using {method} method")
+
+        gs.message(f"Successfully created resampled 3D raster: {output_raster}")
+
+        # Calculate and report statistics
+        try:
+            stats = gs.parse_command('r3.univar', map=output_raster, flags='g')
+            gs.message("-" * 50)
+            gs.message("Output Statistics:")
+            gs.message(f"  Mean:   {float(stats['mean']):.4f}")
+            gs.message(f"  Min:    {float(stats['min']):.4f}")
+            gs.message(f"  Max:    {float(stats['max']):.4f}")
+            gs.message(f"  StdDev: {float(stats['stddev']):.4f}")
+            gs.message("-" * 50)
+        except:
+            pass
 
 
 def main(options, flags):
