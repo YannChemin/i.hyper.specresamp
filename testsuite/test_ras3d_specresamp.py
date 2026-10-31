@@ -7,7 +7,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from test_ras3d_common import (
     WYVERN_PATH, TANAGER_PATH,
     skip_without_ras3d, skip_without_wyvern, skip_without_tanager,
-    open_cube_checked, assert_band_valid, install_ras3d_shim, make_wl_sidecar,
+    open_cube_checked, assert_band_valid, install_ras3d_shim, make_wl_sidecar, load_addon
 )
 
 @skip_without_ras3d
@@ -21,8 +21,8 @@ def test_shim_installs():
 def test_extract_z_slice_ras3d(tmp_path):
     install_ras3d_shim()
     os.environ['RAS3D_OUTDIR'] = str(tmp_path)
-    sys.path.insert(0, '/home/yann/dev/i.hyper.specresamp')
-    from i_hyper_specresamp import extract_z_slice
+    _m = load_addon('i.hyper.specresamp')
+    extract_z_slice = _m.extract_z_slice
     extract_z_slice(WYVERN_PATH, 5, 'specr_slice_5')
     from ras3d_grass_shim import get_band_cache
     assert 'specr_slice_5' in get_band_cache()
@@ -36,8 +36,8 @@ def test_wavelength_sidecar():
     h, r = open_cube_checked(WYVERN_PATH)
     sidecar, _ = make_wl_sidecar(WYVERN_PATH, r['depths'])
     ras3d.close_cube(h)
-    sys.path.insert(0, '/home/yann/dev/i.hyper.specresamp')
-    from i_hyper_specresamp import get_all_band_wavelengths
+    _m = load_addon('i.hyper.specresamp')
+    get_all_band_wavelengths = _m.get_all_band_wavelengths
     bands = get_all_band_wavelengths(WYVERN_PATH)
     assert len(bands) == r['depths']
     os.unlink(sidecar)

@@ -71,6 +71,7 @@
 # % description: Use only valid bands from input metadata
 # %end
 
+import os
 import sys
 import numpy as np
 
@@ -262,6 +263,137 @@ def _write_resampled_metadata(
         outputs=[{"id": meta.dataset_id, "map_name": _to_full_map_name(outmap)}],
     )
     meta.save(outmap)
+
+
+def _read_wl_sidecar(raster3d):
+    """Read the ras3d ``<cube>.wl.json`` sidecar, or return [].
+
+    The canonical writer is ``ras3d_write`` (and *i.hyper.atcorr* in
+    direct-file mode): the path is the cube path with its extension
+    stripped plus ``.wl.json``, and the payload is a flat JSON list of
+    band-centre wavelengths. A list of dicts carrying ``wavelength`` is
+    accepted too, so a richer sidecar written later still loads.
+
+    :param str raster3d: cube path or 3D raster name
+    :return: list of ``(wavelength_nm, fwhm_or_None, valid)`` tuples
+    :rtype: list[tuple]
+    """
+    import json as _json
+
+    for _sfx in ('.tif', '.tiff', '.h5', '.hdf5', '.vrt', '.img', ''):
+        _base = (raster3d.removesuffix(_sfx) if _sfx and raster3d.endswith(_sfx)
+                 else raster3d)
+        _wlp = _base + '.wl.json'
+        if not os.path.isfile(_wlp):
+            continue
+        with open(_wlp) as _fj:
+            _data = _json.load(_fj)
+        _out = []
+        for _entry in _data:
+            if isinstance(_entry, dict):
+                _wl = float(_entry['wavelength'])
+                _fwhm = (float(_entry['fwhm'])
+                         if _entry.get('fwhm') is not None else None)
+                _valid = bool(_entry.get('valid', True))
+            else:
+                _wl, _fwhm, _valid = float(_entry), None, True
+            # ras3d_write stores nm, but i.hyper.atcorr has written um.
+            if _wl < 10.0:
+                _wl *= 1000.0
+            _out.append((_wl, _fwhm, _valid))
+        if _out:
+            return _out
+    return []
+
+
+def _read_hyper_json_bands(raster3d):
+    """Read band metadata from i.hyper.import's ``grid3/<map>/hyper.json``.
+
+    :param str raster3d: 3D raster name, optionally ``name@mapset``
+    :return: list of ``(wavelength_nm, fwhm_or_None, valid)`` tuples
+    :rtype: list[tuple]
+    """
+    import json as _json
+
+    name, mapset = (raster3d.split('@', 1) if '@' in raster3d
+                    else (raster3d, None))
+    try:
+        env = gs.gisenv()
+        mapset = mapset or env['MAPSET']
+        path = os.path.join(env['GISDBASE'], env['LOCATION_NAME'], mapset,
+                            'grid3', name, 'hyper.json')
+    except Exception:
+        return []
+
+    if not os.path.isfile(path):
+        return []
+
+    with open(path) as _fj:
+        data = _json.load(_fj)
+
+    bands = data.get('bands') or {}
+    wavelengths = bands.get('wavelength')
+    if not wavelengths:
+        return []
+    fwhms = bands.get('fwhm') or []
+    validity = bands.get('validity') or []
+    return [(float(wl),
+             float(fwhms[i]) if i < len(fwhms) else None,
+             bool(validity[i]) if i < len(validity) else True)
+            for i, wl in enumerate(wavelengths)]
+
+
+def get_all_band_wavelengths(raster3d, only_valid=False):
+    """Return band metadata for a 3D raster or a cube opened from a file.
+
+    Sources, in order: i.hyper.import's ``hyper.json`` sidecar, the ras3d
+    ``<cube>.wl.json`` sidecar, then ``r3.info`` history. The sidecar route
+    is what makes this work on a cube handed over as a plain file path, with
+    no GRASS mapset behind it.
+
+    :param str raster3d: 3D raster name or cube file path
+    :param bool only_valid: drop bands flagged invalid in the metadata
+    :return: list of dicts with ``band_num``, ``wavelength`` (nm), ``fwhm``,
+             ``valid`` and ``unit``, sorted by wavelength
+    :rtype: list[dict]
+    :raises SystemExit: via ``gs.fatal`` when no source has wavelengths
+    """
+    import re as _re
+
+    entries = _read_hyper_json_bands(raster3d) or _read_wl_sidecar(raster3d)
+
+    if not entries:
+        # Last resort: the 'Band N: W nm, FWHM: F nm' lines r3.info prints.
+        try:
+            hist = gs.read_command('r3.info', map=raster3d, flags='h')
+        except Exception:
+            hist = ''
+        found = {}
+        for line in hist.splitlines():
+            m = _re.match(r'\s*Band\s+(\d+):\s*([\d.]+)\s*(nm|um)?'
+                          r'(?:.*FWHM:\s*([\d.]+))?', line)
+            if m:
+                wl = float(m.group(2))
+                if (m.group(3) or 'nm').lower() == 'um':
+                    wl *= 1000.0
+                found[int(m.group(1))] = (
+                    wl, float(m.group(4)) if m.group(4) else None, True)
+        entries = [found[k] for k in sorted(found)]
+
+    if not entries:
+        gs.fatal(f"No wavelength metadata found for <{raster3d}>. Import the "
+                 "data with i.hyper.import, or provide a .wl.json sidecar.")
+
+    bands = [{'band_num': i, 'wavelength': wl,
+              'fwhm': fwhm if fwhm is not None else 0,
+              'valid': valid, 'unit': 'nm'}
+             for i, (wl, fwhm, valid) in enumerate(entries, start=1)]
+    if only_valid:
+        bands = [b for b in bands if b['valid']]
+        if not bands:
+            gs.fatal("No valid bands found (all marked invalid).")
+    bands.sort(key=lambda b: b['wavelength'])
+    return bands
 
 
 def main():
