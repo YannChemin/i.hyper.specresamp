@@ -1,10 +1,28 @@
 #!/usr/bin/env python3
+# ── ras3d standalone detection ───────────────────────────────────
+# Outside a GRASS session, fall back to libras3d so a cube can be read
+# straight from a file. In a real session GISBASE is set and nothing here
+# takes effect.
+import os as _os
+
+_RAS3D = False
+if not _os.environ.get("GISBASE"):
+    try:
+        import importlib.util as _ilu
+
+        if _ilu.find_spec("ras3d") and _ilu.find_spec("ras3d_grass_shim"):
+            from ras3d_grass_shim import install as _r3_install
+
+            _r3_install()
+            _RAS3D = True
+    except Exception:
+        pass
+# ────────────────────────────────────────────────────────────
 ##############################################################################
 # MODULE:    i.hyper.specresamp
-# AUTHOR(S): Alen Mangafic, Geodetic Institute of Slovenia
+# AUTHOR(S): Yann Chemin
 # PURPOSE:   Spectral resampling of hyperspectral imagery.
-# COPYRIGHT: (C) 2026 by Alen Mangafic and the GRASS Development Team
-# SPDX-License-Identifier: GPL-2.0-or-later
+# SPDX-License-Identifier: Unlicense
 ##############################################################################
 
 # %module
@@ -263,6 +281,67 @@ def _write_resampled_metadata(
         outputs=[{"id": meta.dataset_id, "map_name": _to_full_map_name(outmap)}],
     )
     meta.save(outmap)
+
+
+def extract_z_slice(raster3d, z, name2d):
+    """Extract depth *z* (0-based) of a 3D raster into the 2D raster *name2d*.
+
+    Two paths, picked by whether a GRASS session is available:
+
+    * direct-file (libras3d): read the band out of the cube, publish it in
+      the shim's band cache under *name2d* so later calls resolve the name,
+      and write it next to the other outputs via ``ras3d_write``.
+    * GRASS: window the 3D region to the single depth and let *r3.to.rast*
+      do the work, then rename its suffixed output to *name2d*.
+
+    :param str raster3d: 3D raster name, or a cube path in direct-file mode
+    :param int z: 0-based depth index
+    :param str name2d: name of the 2D raster to create
+    :raises SystemExit: via ``gs.fatal`` if the depth cannot be read
+    """
+    if _RAS3D:
+        import ras3d as _r3
+        import ras3d_write as _r3w
+        from ras3d_grass_shim import get_band_cache
+
+        handle = _r3.open_cube(raster3d)
+        try:
+            arr = _r3.get_band(handle, z)
+            if arr is None:
+                gs.fatal(f"Cannot read depth {z} of <{raster3d}>.")
+            get_band_cache()[name2d] = arr
+            _r3w.write_raster2d(_r3w.outpath(name2d), arr, handle)
+        finally:
+            _r3.close_cube(handle)
+        return
+
+    # r3.to.rast writes one map per depth of the *region*, suffixed _00001
+    # upwards, so narrow the region to the wanted depth and take the single
+    # map it produces. Scoped, so the caller's region survives.
+    info = gs.raster3d_info(raster3d)
+    depths = int(info["depths"])
+    if not 0 <= z < depths:
+        gs.fatal(f"Depth {z} is outside <{raster3d}>, which has {depths}.")
+    tbres = (float(info["top"]) - float(info["bottom"])) / depths
+    bottom = float(info["bottom"]) + z * tbres
+
+    tmp_prefix = f"tmp_specresamp_{_os.getpid()}_{z}"
+    gs.use_temp_region()
+    try:
+        gs.run_command("g.region", raster_3d=raster3d, quiet=True)
+        gs.run_command("g.region", b=bottom, t=bottom + tbres, tbres=tbres, quiet=True)
+        gs.run_command(
+            "r3.to.rast", input=raster3d, output=tmp_prefix, quiet=True, overwrite=True
+        )
+    finally:
+        gs.del_temp_region()
+
+    produced = f"{tmp_prefix}_00001"
+    if not gs.find_file(produced, element="cell")["file"]:
+        gs.fatal(f"r3.to.rast produced no map for depth {z} of <{raster3d}>.")
+    gs.run_command(
+        "g.rename", raster=f"{produced},{name2d}", quiet=True, overwrite=True
+    )
 
 
 def _read_wl_sidecar(raster3d):
