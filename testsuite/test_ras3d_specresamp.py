@@ -7,7 +7,8 @@ sys.path.insert(0, os.path.dirname(__file__))
 from test_ras3d_common import (
     WYVERN_PATH, TANAGER_PATH,
     skip_without_ras3d, skip_without_wyvern, skip_without_tanager,
-    open_cube_checked, assert_band_valid, install_ras3d_shim, make_wl_sidecar, load_addon
+    open_cube_checked, assert_band_valid, install_ras3d_shim, make_wl_sidecar, load_addon,
+    remove_wl_sidecar,
 )
 
 @skip_without_ras3d
@@ -40,7 +41,7 @@ def test_wavelength_sidecar():
     get_all_band_wavelengths = _m.get_all_band_wavelengths
     bands = get_all_band_wavelengths(WYVERN_PATH)
     assert len(bands) == r['depths']
-    os.unlink(sidecar)
+    remove_wl_sidecar(sidecar)
 
 @skip_without_ras3d
 @skip_without_tanager
